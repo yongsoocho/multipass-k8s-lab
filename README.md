@@ -41,7 +41,7 @@ Ubuntu SSH 계정 암호는 요청한 대로 **`test`**입니다. 공개된 연�
 .\destroy.ps1
 ```
 
-이 명령은 **현재 Multipass 드라이버에서 보이는 모든 VM**과 그 디스크·스냅샷을 영구 삭제하고, 삭제 대기 중인 VM을 purge하며, 이 프로젝트의 `MultipassK8s` Hyper-V 스위치를 제거합니다. 다른 Hyper-V 스위치, Docker 볼륨/네트워크 및 다른 Multipass 드라이버의 VM은 건드리지 않습니다.
+이 명령은 Windows Multipass의 현재 드라이버와 `hyperv`·`hcs` 드라이버에서 보이는 **모든 VM**과 그 디스크·스냅샷을 영구 삭제하고, 삭제 대기 중인 VM을 purge하며, 이 프로젝트의 `MultipassK8s` Hyper-V 스위치를 제거합니다. 실행 후 원래 드라이버를 복원합니다. 설치된 Multipass 버전에서 지원하지 않는 드라이버는 경고와 함께 건너뜁니다. 다른 Hyper-V 스위치와 Docker 볼륨/네트워크는 건드리지 않습니다.
 
 ## 구현과 제한
 
