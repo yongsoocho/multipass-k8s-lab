@@ -6,7 +6,7 @@ if (-not (Get-Command multipass -ErrorAction SilentlyContinue)) { throw 'Multipa
 
 $originalDriver = (& multipass get local.driver | Out-String).Trim()
 if ($LASTEXITCODE -ne 0) { throw 'Cannot read Multipass driver.' }
-$drivers = @($originalDriver, 'hyperv', 'hcs') | Select-Object -Unique
+$drivers = @($originalDriver, 'hyperv', 'hcs', 'virtualbox') | Select-Object -Unique
 $failedDrivers = [System.Collections.Generic.List[string]]::new()
 try {
     foreach ($driver in $drivers) {
