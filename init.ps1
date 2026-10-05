@@ -1,3 +1,4 @@
+#requires -Version 7.2
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 
@@ -9,10 +10,10 @@ if ($args.Count -gt 1 -or ($args.Count -eq 1 -and $args[0] -notin @('-e', '--ext
 if ($args.Count -eq 1) { $extended = $true }
 
 $root = Split-Path -Parent $PSCommandPath
+. (Join-Path $root 'scripts/host-access.ps1')
 $switchName = 'MultipassK8s'
 $vip = '192.168.35.209'
 $k8sMinor = 'v1.37'
-$flannelUrl = 'https://github.com/flannel-io/flannel/releases/latest/download/kube-flannel.yml'
 $nodes = [System.Collections.Generic.List[object]]::new()
 $masterCount = if ($extended) { 3 } else { 1 }
 $workerCount = if ($extended) { 6 } else { 2 }
@@ -43,21 +44,24 @@ function Run-Node {
 }
 
 if (-not (Get-Command multipass -ErrorAction SilentlyContinue)) { throw 'Multipass is not installed.' }
+foreach ($command in @('ssh', 'sftp', 'ssh-keygen')) {
+    if (-not (Get-Command $command -ErrorAction SilentlyContinue)) { throw "Windows OpenSSH Client is required ($command not found)." }
+}
 if (-not (Get-Command Get-VMSwitch -ErrorAction SilentlyContinue)) { throw 'Hyper-V PowerShell module is unavailable. Enable Hyper-V and restart Windows.' }
 $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
 $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run PowerShell as Administrator.' }
 
-$existing = (Invoke-Mp @('list', '--format', 'json') | Out-String | ConvertFrom-Json).info
-if (@($existing.PSObject.Properties | Where-Object { $_.Name -like 'k8s-*' }).Count -gt 0) {
+$existing = @((Invoke-Mp @('list', '--format', 'json') | Out-String | ConvertFrom-Json).list)
+if (@($existing | Where-Object { $_.name -like 'k8s-*' }).Count -gt 0) {
     throw 'Existing k8s-* Multipass instances found. Run destroy.ps1 before rebuilding.'
 }
 $driver = (Invoke-Mp @('get', 'local.driver') | Out-String).Trim()
 if ($driver -ne 'hyperv') {
-    if ($existing.PSObject.Properties.Count -gt 0) { throw "Current driver is '$driver' and has instances. Remove or migrate them before switching to hyperv." }
+    if ($existing.Count -gt 0) { throw "Current driver is '$driver' and has instances. Remove or migrate them before switching to hyperv." }
     Invoke-Mp @('set', 'local.driver=hyperv') | Out-Null
-    $existing = (Invoke-Mp @('list', '--format', 'json') | Out-String | ConvertFrom-Json).info
-    if ($existing.PSObject.Properties.Count -gt 0) { throw 'The hyperv driver already has instances. Inspect them before building this cluster.' }
+    $existing = @((Invoke-Mp @('list', '--format', 'json') | Out-String | ConvertFrom-Json).list)
+    if ($existing.Count -gt 0) { throw 'The hyperv driver already has instances. Inspect them before building this cluster.' }
 }
 
 $hostIps = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -match '^192\.168\.35\.\d+$' -and $_.PrefixLength -eq 24 -and $_.InterfaceAlias -notlike 'vEthernet*' })
@@ -80,6 +84,12 @@ if ($extended -and (Test-Connection -TargetName $vip -Count 1 -Quiet -TimeoutSec
 $temporary = Join-Path ([IO.Path]::GetTempPath()) ('multipass-k8s-' + [guid]::NewGuid().ToString('N'))
 New-Item -ItemType Directory -Path $temporary | Out-Null
 try {
+    $publicKeys = [System.Collections.Generic.List[string]]::new()
+    $publicKeys.Add((Initialize-LabHostKey))
+    $hostsFile = Join-Path $temporary 'lab-hosts'
+    $hostsLines = @($nodes | ForEach-Object { "$($_.IP) $($_.Name)" })
+    if ($extended) { $hostsLines += "$vip k8s-api" } else { $hostsLines += '192.168.35.200 k8s-api' }
+    [IO.File]::WriteAllText($hostsFile, ($hostsLines -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
     foreach ($node in $nodes) {
         Write-Host "Launching $($node.Name) at $($node.IP)"
         $cloudInit = Join-Path $temporary "$($node.Name)-cloud-init.yaml"
@@ -117,7 +127,30 @@ network:
         Run-Node $node.Name @('bash', '-c', "ip -4 addr | grep -F '$($node.IP)/24'") | Out-Null
         Send-File (Join-Path $root 'scripts/setup-node.sh') $node.Name '/home/ubuntu/setup-node.sh'
         Run-Node $node.Name @('bash', '/home/ubuntu/setup-node.sh', $k8sMinor, $node.IP) | Out-Host
+        Send-File $hostsFile $node.Name '/home/ubuntu/lab-hosts'
+        Send-File (Join-Path $root 'scripts/setup-access.sh') $node.Name '/home/ubuntu/setup-access.sh'
+        $nodePublicKey = (Run-Node $node.Name @('bash', '/home/ubuntu/setup-access.sh', 'prepare', '/home/ubuntu/lab-hosts') | Out-String).Trim()
+        if ($nodePublicKey -notmatch '^ssh-ed25519 [A-Za-z0-9+/]+={0,3} [^\r\n]+$') { throw "Invalid public key returned by $($node.Name)." }
+        $publicKeys.Add($nodePublicKey)
     }
+
+    $publicKeysFile = Join-Path $temporary 'lab-authorized-keys'
+    [IO.File]::WriteAllText($publicKeysFile, ($publicKeys -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
+    foreach ($node in $nodes) {
+        Send-File $publicKeysFile $node.Name '/home/ubuntu/lab-authorized-keys'
+        Run-Node $node.Name @('bash', '/home/ubuntu/setup-access.sh', 'authorize', '/home/ubuntu/lab-authorized-keys') | Out-Null
+    }
+    Set-LabHostSshConfig -Nodes $nodes.ToArray()
+    $sftpBatch = Join-Path $temporary 'sftp-check.txt'
+    [IO.File]::WriteAllText($sftpBatch, "pwd`nquit`n", [Text.UTF8Encoding]::new($false))
+    foreach ($node in $nodes) {
+        $remoteName = (& ssh -o BatchMode=yes -o ConnectTimeout=10 $node.Name hostname | Out-String).Trim()
+        if ($LASTEXITCODE -ne 0 -or $remoteName -ne $node.Name) { throw "SSH by hostname failed for $($node.Name)." }
+        & sftp -o ConnectTimeout=10 -b $sftpBatch $node.Name
+        if ($LASTEXITCODE -ne 0) { throw "SFTP by hostname failed for $($node.Name)." }
+        Run-Node $node.Name @('ssh', '-o', 'BatchMode=yes', '-o', 'ConnectTimeout=10', 'k8s-master-1', 'hostname') | Out-Null
+    }
+    Write-Host 'SSH/SFTP by hostname and VM-to-master SSH checks passed.'
 
     if ($extended) {
         foreach ($node in @($nodes | Where-Object Role -eq 'master')) {
@@ -131,12 +164,11 @@ network:
 
     $first = 'k8s-master-1'
     $endpoint = if ($extended) { "${vip}:16443" } else { '192.168.35.200:6443' }
-    $initArgs = @('sudo', 'kubeadm', 'init', '--apiserver-advertise-address=192.168.35.200', "--control-plane-endpoint=$endpoint", '--pod-network-cidr=10.244.0.0/16', '--upload-certs')
+    $kubernetesVersion = (Run-Node $first @('kubeadm', 'version', '-o', 'short') | Out-String).Trim()
+    if ($kubernetesVersion -notmatch '^v1\.37\.\d+$') { throw "Unexpected kubeadm version: $kubernetesVersion" }
+    $initArgs = @('sudo', 'kubeadm', 'init', "--kubernetes-version=$kubernetesVersion", '--apiserver-advertise-address=192.168.35.200', "--control-plane-endpoint=$endpoint", '--pod-network-cidr=10.244.0.0/16', '--upload-certs')
     Run-Node $first $initArgs | Out-Host
     Run-Node $first @('bash', '-c', 'mkdir -p /home/ubuntu/.kube && sudo cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config && sudo chown ubuntu:ubuntu /home/ubuntu/.kube/config') | Out-Null
-    Run-Node $first @('bash', '-c', "curl -fsSL '$flannelUrl' -o /tmp/kube-flannel.yml && kubectl apply -f /tmp/kube-flannel.yml") | Out-Host
-    $flannelPatch = '[{"op":"add","path":"/spec/template/spec/containers/0/args/-","value":"--iface-regex=^192[.]168[.]35[.]"}]'
-    Run-Node $first @('kubectl', '-n', 'kube-flannel', 'patch', 'daemonset', 'kube-flannel-ds', '--type=json', "--patch=$flannelPatch") | Out-Host
 
     $workerJoin = (Run-Node $first @('sudo', 'kubeadm', 'token', 'create', '--print-join-command') | Out-String).Trim()
     if ($workerJoin -notmatch '^kubeadm join ') { throw 'Could not obtain worker join command.' }
@@ -151,10 +183,28 @@ network:
     foreach ($node in @($nodes | Where-Object Role -eq 'worker')) {
         Run-Node $node.Name @('bash', '-c', "sudo $workerJoin") | Out-Host
     }
-    Run-Node $first @('kubectl', 'wait', '--for=condition=Ready', 'nodes', '--all', '--timeout=600s') | Out-Host
+    foreach ($node in @($nodes | Where-Object Role -eq 'master')) {
+        Run-Node $node.Name @('bash', '-c', 'mkdir -p /home/ubuntu/.kube && sudo cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config && sudo chown ubuntu:ubuntu /home/ubuntu/.kube/config && chmod 600 /home/ubuntu/.kube/config && sudo install -d -m 700 /root/.kube && sudo install -m 600 /etc/kubernetes/admin.conf /root/.kube/config') | Out-Null
+    }
+    # Node registration does not require a CNI; Ready does.
+    $expectedNodes = @($nodes | ForEach-Object Name)
+    for ($attempt = 0; $attempt -lt 30; $attempt++) {
+        $registered = (Run-Node $first @('kubectl', 'get', 'nodes', '-o', 'json') | Out-String | ConvertFrom-Json).items
+        $registeredNames = @($registered | ForEach-Object { $_.metadata.name })
+        if (@($expectedNodes | Where-Object { $_ -notin $registeredNames }).Count -eq 0) { break }
+        if ($attempt -eq 29) { throw 'Timed out waiting for all nodes to register.' }
+        Start-Sleep -Seconds 2
+    }
+    Run-Node $first @('kubectl', 'get', '--raw=/readyz') | Out-Host
     Run-Node $first @('kubectl', 'get', 'nodes', '-o', 'wide') | Out-Host
-    Write-Host "Cluster ready. SSH: ssh ubuntu@192.168.35.200 (password: test). Kubernetes: multipass exec $first -- kubectl get nodes"
+    Write-Host 'Bootstrap complete. No CNI was installed: NotReady nodes and Pending CoreDNS are expected.'
+    Write-Host 'Install one CNI manually, or run .\install-calico.ps1 OR .\install-flannel.ps1.'
+    Write-Host 'SSH: ssh k8s-master-1 | SFTP: sftp k8s-master-1 | Ubuntu password fallback: test'
 }
 finally {
-    Remove-Item -LiteralPath $temporary -Recurse -Force -ErrorAction SilentlyContinue
+    $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar
+    $resolvedTemporary = [IO.Path]::GetFullPath($temporary)
+    if ($resolvedTemporary.StartsWith($tempRoot, [StringComparison]::OrdinalIgnoreCase) -and (Split-Path $resolvedTemporary -Leaf) -like 'multipass-k8s-*') {
+        Remove-Item -LiteralPath $resolvedTemporary -Recurse -Force -ErrorAction SilentlyContinue
+    }
 }

@@ -1,5 +1,7 @@
+#requires -Version 7.2
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
+. (Join-Path $PSScriptRoot 'scripts/host-access.ps1')
 
 if ($args.Count -ne 0) { throw 'Usage: .\destroy.ps1' }
 if (-not (Get-Command multipass -ErrorAction SilentlyContinue)) { throw 'Multipass is not installed.' }
@@ -20,7 +22,7 @@ try {
         }
         $list = & multipass list --format json | Out-String | ConvertFrom-Json
         if ($LASTEXITCODE -ne 0) { throw "Cannot list Multipass instances under '$driver'." }
-        $names = @($list.info.PSObject.Properties.Name)
+        $names = @($list.list | ForEach-Object { $_.name })
         if ($names.Count -gt 0) {
             & multipass delete --purge @names
             if ($LASTEXITCODE -ne 0) { throw "Multipass deletion failed under '$driver'." }
@@ -46,5 +48,6 @@ if (Get-Command Get-VMSwitch -ErrorAction SilentlyContinue) {
         Remove-VMSwitch -Name $switchName -Force
     }
 }
-if ($failedDrivers.Count -gt 0) { throw "Cleanup completed for available drivers, but these drivers could not be inspected: $($failedDrivers -join ', ')." }
-Write-Host 'All Multipass instances and VM disks in available Windows drivers were purged; the MultipassK8s switch was removed if present.'
+Remove-LabHostAccess
+if ($failedDrivers.Count -gt 0) { Write-Warning "These drivers could not be inspected: $($failedDrivers -join ', '). If you used them before, check their installation and permissions before assuming every VM was removed." }
+Write-Host 'All instances in inspected Multipass drivers were purged; the lab switch and current user lab SSH configuration were removed if present.'

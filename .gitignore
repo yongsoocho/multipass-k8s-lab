@@ -2,4 +2,9 @@
 *.kubeconfig
 *.log
 .env
+.ssh/
+*.pem
+*.key
+*.pub
+known_hosts*
 
