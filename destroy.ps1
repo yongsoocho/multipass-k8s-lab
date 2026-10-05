@@ -4,16 +4,35 @@ Set-StrictMode -Version Latest
 if ($args.Count -ne 0) { throw 'Usage: .\destroy.ps1' }
 if (-not (Get-Command multipass -ErrorAction SilentlyContinue)) { throw 'Multipass is not installed.' }
 
-# This intentionally removes every instance visible under the active Multipass driver.
-$list = & multipass list --format json | Out-String | ConvertFrom-Json
-if ($LASTEXITCODE -ne 0) { throw 'Cannot list Multipass instances.' }
-$names = @($list.info.PSObject.Properties.Name)
-if ($names.Count -gt 0) {
-    & multipass delete --purge @names
-    if ($LASTEXITCODE -ne 0) { throw 'Multipass instance deletion failed.' }
+$originalDriver = (& multipass get local.driver | Out-String).Trim()
+if ($LASTEXITCODE -ne 0) { throw 'Cannot read Multipass driver.' }
+$drivers = @($originalDriver, 'hyperv', 'hcs') | Select-Object -Unique
+$failedDrivers = [System.Collections.Generic.List[string]]::new()
+try {
+    foreach ($driver in $drivers) {
+        if ($driver -ne $originalDriver) {
+            & multipass set "local.driver=$driver" 2>$null
+            if ($LASTEXITCODE -ne 0) {
+                Write-Warning "Could not switch to '$driver' (possibly unsupported by this Multipass version)."
+                $failedDrivers.Add($driver)
+                continue
+            }
+        }
+        $list = & multipass list --format json | Out-String | ConvertFrom-Json
+        if ($LASTEXITCODE -ne 0) { throw "Cannot list Multipass instances under '$driver'." }
+        $names = @($list.info.PSObject.Properties.Name)
+        if ($names.Count -gt 0) {
+            & multipass delete --purge @names
+            if ($LASTEXITCODE -ne 0) { throw "Multipass deletion failed under '$driver'." }
+        }
+        & multipass purge
+        if ($LASTEXITCODE -ne 0) { throw "Multipass purge failed under '$driver'." }
+    }
 }
-& multipass purge
-if ($LASTEXITCODE -ne 0) { throw 'Multipass purge failed.' }
+finally {
+    & multipass set "local.driver=$originalDriver" | Out-Null
+    if ($LASTEXITCODE -ne 0) { Write-Warning "Could not restore Multipass driver '$originalDriver'." }
+}
 
 $switchName = 'MultipassK8s'
 if (Get-Command Get-VMSwitch -ErrorAction SilentlyContinue) {
@@ -27,4 +46,5 @@ if (Get-Command Get-VMSwitch -ErrorAction SilentlyContinue) {
         Remove-VMSwitch -Name $switchName -Force
     }
 }
-Write-Host 'All instances and VM disks in the active Multipass driver were purged; the MultipassK8s switch was removed if present.'
+if ($failedDrivers.Count -gt 0) { throw "Cleanup completed for available drivers, but these drivers could not be inspected: $($failedDrivers -join ', ')." }
+Write-Host 'All Multipass instances and VM disks in available Windows drivers were purged; the MultipassK8s switch was removed if present.'
