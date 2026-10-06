@@ -13,8 +13,8 @@ if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administra
     throw 'Run PowerShell 7 as Administrator. No cleanup has started.'
 }
 
-$originalDriver = Get-LabDestroyDriver
-$versionResult = Invoke-LabMultipassProbe -Arguments @('version')
+$originalDriver = Initialize-LabDestroyConnection
+$versionResult = Invoke-LabDestroyRead -Arguments @('version')
 if ($versionResult.ExitCode -ne 0 -or $versionResult.StandardOutput -notmatch '(?m)^multipass\s+(\d+\.\d+\.\d+)') {
     throw "Cannot determine Multipass version: $($versionResult.Output)"
 }
