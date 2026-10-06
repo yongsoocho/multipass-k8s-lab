@@ -139,9 +139,14 @@ Pod가 준비되면 `http://192.168.35.201:30080`으로 확인할 수 있습니�
 - 초기 구축에는 CNI를 배포하지 않습니다. Calico/Flannel 선택 설치는 별도 스크립트가 담당합니다.
 - `init.ps1`는 기존 `k8s-*` VM을 발견하면 중단합니다. **kubeadm init/join 이전** 네트워크·패키지 설치 단계에서 실패했다면 VM을 보존한 채 `./init.ps1 -Resume`으로 재개하세요. 확장 구성은 `./init.ps1 -e -Resume`입니다. VM 이름·LAN MAC과 Kubernetes 초기화 여부를 확인하며, 이미 초기화된 노드는 재개를 거부합니다.
 - `netplan apply` 중 기본 NIC의 DHCP 주소가 바뀌면 Multipass 연결이 잠시 끊길 수 있습니다. 네트워크 적용은 VM 내부의 독립된 systemd 작업으로 실행하고, 최대 240초 동안 재접속과 작업 결과를 확인합니다. 고정 IP와 관리용 기본 경로까지 확인해야 다음 단계로 진행합니다. 실패 시 출력되는 VM 내부 `apply.log` 경로를 확인하세요.
+- Windows용 Multipass가 한글 로컬 경로를 잘못 읽는 문제를 피하기 위해 파일과 cloud-init 설정은 표준입력으로 전달합니다. VM에 전송한 파일은 SHA256까지 확인합니다. 저장소를 영문 경로로 옮길 필요가 없습니다.
 - Multipass 1.17부터 기존 `hyperv` 드라이버는 사용 중단 예정입니다. 이 프로젝트는 요청대로 해당 드라이버를 명시적으로 선택합니다.
 
 `pwsh -NoProfile -File .\tests\verify.ps1`은 PowerShell 구문과 격리된 테스트 디렉터리에서 SSH 설정/키 생성·정리를 검사합니다. 실제 클러스터 통합 테스트에는 Hyper-V와 Multipass가 필요합니다.
+
+`pwsh -NoProfile -File .\tests\network.ps1`은 연결 끊김·재접속·타임아웃 처리를 검사합니다. 실행 중인 VM이 있으면 `pwsh -NoProfile -File .\tests\transfer-live.ps1 -Node k8s-master-1`로 한글·공백·괄호 경로, 바이너리·빈 파일, 모든 셸 스크립트의 실제 전송과 SHA256을 검사할 수 있습니다. 이 검사는 VM의 임시 디렉터리만 사용하고 정리합니다.
+
+구축 후에는 `pwsh -NoProfile -File .\tests\cluster-live.ps1`로 노드 등록과 API 상태를 다시 확인합니다. 확장 구성은 `-Extended`를 붙입니다. 이 검사는 CNI를 설치하지 않습니다.
 
 참고: [Multipass static IP](https://canonical.com/multipass/docs/latest/how-to-guides/manage-instances/configure-static-ips/), [Kubernetes kubeadm](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/install-kubeadm/), [kubeadm HA](https://kubernetes.io/docs/setup/production-environment/tools/kubeadm/high-availability/), [Calico 요구사항](https://docs.tigera.io/calico/latest/getting-started/kubernetes/requirements), [Flannel](https://github.com/flannel-io/flannel), [Helm 설치](https://helm.sh/docs/intro/install/), [crictl](https://kubernetes.io/docs/tasks/debug/debug-cluster/crictl/).
 

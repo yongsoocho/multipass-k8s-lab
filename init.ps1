@@ -16,6 +16,8 @@ foreach ($argument in $args) {
 $root = Split-Path -Parent $PSCommandPath
 . (Join-Path $root 'scripts/host-access.ps1')
 . (Join-Path $root 'scripts/network.ps1')
+. (Join-Path $root 'scripts/multipass-io.ps1')
+. (Join-Path $root 'scripts/cluster-check.ps1')
 $switchName = 'MultipassK8s'
 $vip = '192.168.35.209'
 $k8sMinor = 'v1.37'
@@ -43,7 +45,7 @@ function Invoke-Mp {
 
 function Send-File {
     param([string]$Source, [string]$Node, [string]$Target)
-    Invoke-Mp @('transfer', $Source, "${Node}:$Target") | Out-Null
+    Send-LabFile -Source $Source -Node $Node -Target $Target
 }
 
 function Run-Node {
@@ -134,7 +136,7 @@ packages:
 runcmd:
   - [systemctl, enable, --now, ssh]
 '@ | Set-Content -LiteralPath $cloudInit -Encoding utf8
-            Invoke-Mp @('launch', '24.04', '--name', $node.Name, '--cpus', "$($node.Cpu)", '--memory', $node.Memory, '--disk', $node.Disk, '--network', "name=$switchName,mode=manual,mac=$($node.Mac)", '--cloud-init', $cloudInit, '--timeout', '900') | Out-Host
+            Invoke-LabMultipassInput -Source $cloudInit -TimeoutSeconds 1100 -Arguments @('launch', '24.04', '--name', $node.Name, '--cpus', "$($node.Cpu)", '--memory', $node.Memory, '--disk', $node.Disk, '--network', "name=$switchName,mode=manual,mac=$($node.Mac)", '--cloud-init', '-', '--timeout', '900') | Out-Host
         } else {
             Write-Host "Resuming provisioning of $($node.Name) at $($node.IP)"
         }
@@ -219,19 +221,7 @@ network:
         Run-Node $node.Name @('bash', '-c', 'mkdir -p /home/ubuntu/.kube && sudo cp /etc/kubernetes/admin.conf /home/ubuntu/.kube/config && sudo chown ubuntu:ubuntu /home/ubuntu/.kube/config && chmod 600 /home/ubuntu/.kube/config && sudo install -d -m 700 /root/.kube && sudo install -m 600 /etc/kubernetes/admin.conf /root/.kube/config') | Out-Null
     }
     # Node registration does not require a CNI; Ready does.
-    $expectedNodes = @($nodes | ForEach-Object Name)
-    for ($attempt = 0; $attempt -lt 30; $attempt++) {
-        $registered = (Run-Node $first @('kubectl', 'get', 'nodes', '-o', 'json') | Out-String | ConvertFrom-Json).items
-        $registeredNames = @($registered | ForEach-Object { $_.metadata.name })
-        if (@($expectedNodes | Where-Object { $_ -notin $registeredNames }).Count -eq 0) { break }
-        if ($attempt -eq 29) { throw 'Timed out waiting for all nodes to register.' }
-        Start-Sleep -Seconds 2
-    }
-    Run-Node $first @('kubectl', 'get', '--raw=/readyz') | Out-Host
-    Run-Node $first @('kubectl', 'get', 'nodes', '-o', 'wide') | Out-Host
-    Write-Host 'Bootstrap complete. No CNI was installed: NotReady nodes and Pending CoreDNS are expected.'
-    Write-Host 'Install one CNI manually, or run .\install-calico.ps1 OR .\install-flannel.ps1.'
-    Write-Host 'SSH: ssh k8s-master-1 | SFTP: sftp k8s-master-1 | Ubuntu password fallback: test'
+    Test-LabCluster -Master $first -ExpectedNodes @($nodes | ForEach-Object Name)
 }
 finally {
     $tempRoot = [IO.Path]::GetFullPath([IO.Path]::GetTempPath()).TrimEnd([IO.Path]::DirectorySeparatorChar) + [IO.Path]::DirectorySeparatorChar

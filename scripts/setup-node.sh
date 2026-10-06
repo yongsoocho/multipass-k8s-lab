@@ -1,9 +1,20 @@
 #!/usr/bin/env bash
 set -euo pipefail
+trap 'result=$?; echo "Node setup failed at line $LINENO (exit $result)." >&2; exit "$result"' ERR
 
 K8S_MINOR="${1:?Kubernetes minor version required}"
 NODE_IP="${2:?node IP required}"
 HELM_VERSION='v4.3.0'
+
+retry() {
+  local attempt
+  for attempt in 1 2 3; do
+    if "$@"; then return 0; fi
+    echo "Attempt $attempt/3 failed: $*" >&2
+    if [[ "$attempt" -lt 3 ]]; then sleep 5; fi
+  done
+  return 1
+}
 
 work_dir="$(mktemp -d)"
 trap 'rm -rf -- "$work_dir"' EXIT
@@ -31,7 +42,7 @@ sudo systemctl enable --now containerd ssh
 sudo systemctl restart containerd
 
 sudo mkdir -p -m 755 /etc/apt/keyrings
-curl -fsSL "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key" |
+curl -fsSL --connect-timeout 15 --max-time 60 --retry 3 "https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/Release.key" |
   sudo gpg --dearmor --yes -o /etc/apt/keyrings/kubernetes-apt-keyring.gpg
 echo "deb [signed-by=/etc/apt/keyrings/kubernetes-apt-keyring.gpg] https://pkgs.k8s.io/core:/stable:/${K8S_MINOR}/deb/ /" |
   sudo tee /etc/apt/sources.list.d/kubernetes.list >/dev/null
@@ -50,7 +61,8 @@ if [[ -z "$pause_image" ]]; then
   echo 'Cannot determine the kubeadm pause image.' >&2
   exit 1
 fi
-sudo sed -i -E "s|^([[:space:]]*sandbox_image[[:space:]]*=[[:space:]]*).*|\1\"$pause_image\"|" /etc/containerd/config.toml
+# containerd 1.x calls this sandbox_image; 2.x uses pinned_images.sandbox.
+sudo sed -i -E "s|^([[:space:]]*(sandbox_image\|sandbox)[[:space:]]*=[[:space:]]*).*|\1\"$pause_image\"|" /etc/containerd/config.toml
 sudo systemctl restart containerd
 cat <<'EOF' | sudo tee /etc/crictl.yaml >/dev/null
 runtime-endpoint: unix:///run/containerd/containerd.sock
@@ -68,7 +80,7 @@ case "$architecture" in
   *) echo "Unsupported architecture: $architecture" >&2; exit 1 ;;
 esac
 helm_archive="helm-${HELM_VERSION}-linux-${architecture}.tar.gz"
-curl --fail --silent --show-error --location --retry 3 \
+curl --fail --silent --show-error --location --connect-timeout 15 --max-time 180 --retry 3 \
   "https://get.helm.sh/$helm_archive" -o "$work_dir/$helm_archive"
 printf '%s  %s\n' "$helm_sha256" "$work_dir/$helm_archive" | sha256sum --check --strict -
 tar -xzf "$work_dir/$helm_archive" -C "$work_dir" "linux-${architecture}/helm"
@@ -77,10 +89,10 @@ sudo install -m 0755 "$work_dir/linux-${architecture}/helm" /usr/local/bin/helm
 # Helm repositories are per-user. Configure both the normal SSH user and root
 # so `helm`, `h`, and `sudo helm` see the same initial repository list.
 for account in ubuntu root; do
-  sudo -H -u "$account" /usr/local/bin/helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ --force-update
-  sudo -H -u "$account" /usr/local/bin/helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
-  sudo -H -u "$account" /usr/local/bin/helm repo add jetstack https://charts.jetstack.io --force-update
-  sudo -H -u "$account" /usr/local/bin/helm repo update
+  retry timeout 60s sudo -H -u "$account" /usr/local/bin/helm repo add metrics-server https://kubernetes-sigs.github.io/metrics-server/ --force-update
+  retry timeout 60s sudo -H -u "$account" /usr/local/bin/helm repo add prometheus-community https://prometheus-community.github.io/helm-charts --force-update
+  retry timeout 60s sudo -H -u "$account" /usr/local/bin/helm repo add jetstack https://charts.jetstack.io --force-update
+  # repo add already downloads and validates each index; no duplicate update.
 done
 
 # Install the same etcd release as kubeadm's stacked-etcd image, including
@@ -93,8 +105,8 @@ if [[ ! "$etcd_version" =~ ^3\.[0-9]+\.[0-9]+$ ]]; then
 fi
 etcd_release="etcd-v${etcd_version}-linux-${architecture}"
 etcd_url="https://github.com/etcd-io/etcd/releases/download/v${etcd_version}"
-curl --fail --silent --show-error --location --retry 3 "$etcd_url/$etcd_release.tar.gz" -o "$work_dir/$etcd_release.tar.gz"
-curl --fail --silent --show-error --location --retry 3 "$etcd_url/SHA256SUMS" -o "$work_dir/etcd-SHA256SUMS"
+curl --fail --silent --show-error --location --connect-timeout 15 --max-time 180 --retry 3 "$etcd_url/$etcd_release.tar.gz" -o "$work_dir/$etcd_release.tar.gz"
+curl --fail --silent --show-error --location --connect-timeout 15 --max-time 60 --retry 3 "$etcd_url/SHA256SUMS" -o "$work_dir/etcd-SHA256SUMS"
 awk -v archive="$etcd_release.tar.gz" '$2 == archive {print}' "$work_dir/etcd-SHA256SUMS" > "$work_dir/etcd-checksum"
 if [[ ! -s "$work_dir/etcd-checksum" ]]; then
   echo "No official checksum found for $etcd_release.tar.gz" >&2
@@ -150,7 +162,7 @@ sudo /usr/sbin/sshd -t
 sshd_settings="$(sudo /usr/sbin/sshd -T -C user=ubuntu,host=localhost,addr=127.0.0.1)"
 grep -qx 'passwordauthentication yes' <<< "$sshd_settings"
 grep -qx 'pubkeyauthentication yes' <<< "$sshd_settings"
-grep -qx 'subsystem sftp internal-sftp' <<< "$sshd_settings"
+grep -Eq '^subsystem sftp internal-sftp[[:space:]]*$' <<< "$sshd_settings"
 sudo systemctl enable --now ssh
 sudo systemctl restart ssh
 

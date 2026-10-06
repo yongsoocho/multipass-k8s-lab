@@ -1,3 +1,5 @@
+. (Join-Path $PSScriptRoot 'multipass-io.ps1')
+
 function Invoke-CniMultipass {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
     & multipass @Arguments
@@ -17,18 +19,17 @@ function Install-LabCni {
 
     $first = 'k8s-master-1'
     $installer = Join-Path $PSScriptRoot 'install-cni.sh'
-    $nodesJson = Invoke-CniMultipass @('exec', $first, '--', 'kubectl', 'get', 'nodes', '-o', 'json')
-    $nodes = @((($nodesJson | Out-String) | ConvertFrom-Json).items)
+    $names = (Invoke-CniMultipass @('exec', $first, '--', 'kubectl', 'get', 'nodes', '-o', 'jsonpath={.items[*].metadata.name}') | Out-String).Trim()
+    $nodes = @($names -split '\s+' | Where-Object { $_ })
     if ($nodes.Count -eq 0) { throw 'No joined nodes found. Run init.ps1 first.' }
 
     # Check every VM before changing cluster resources, including stale host CNI files.
-    foreach ($node in $nodes) {
-        $name = $node.metadata.name
+    foreach ($name in $nodes) {
         if ($name -notmatch '^k8s-(master|worker)-[1-6]$') {
             throw "Unexpected node '$name'. These installers target the Multipass lab only."
         }
         Write-Host "[$name] Checking existing CNI configuration."
-        Invoke-CniMultipass @('transfer', $installer, "${name}:/home/ubuntu/install-cni.sh")
+        Send-LabFile -Source $installer -Node $name -Target '/home/ubuntu/install-cni.sh'
         Invoke-CniMultipass @('exec', $name, '--', 'bash', '/home/ubuntu/install-cni.sh', 'check', $Provider)
     }
 
