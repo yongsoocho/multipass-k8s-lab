@@ -10,6 +10,31 @@ Windows의 PowerShell 7.2 이상에서 Multipass와 Hyper-V로 Ubuntu 24.04 기�
 - 3노드 구성은 VM RAM 6GB와 디스크 50GB, 9노드 구성은 VM RAM 18GB와 디스크 150GB가 필요합니다. 호스트 운영체제와 이미지 다운로드 공간은 별도입니다.
 - VM에서 `pkgs.k8s.io`, `registry.k8s.io`, `get.helm.sh`, GitHub, Helm 저장소 및 Ubuntu 저장소에 접속할 수 있어야 합니다. 노드 사이 Kubernetes 통신과 LAN에서 TCP 22(SSH/SFTP), 6443/16443(API), 확장 구성의 VRRP가 허용되어야 합니다. CNI 설치 시 Calico VXLAN은 UDP 4789, Flannel VXLAN은 UDP 8472를 사용합니다.
 
+### PowerShell 5.1에서 PowerShell 7로 전환
+
+**Windows 기본 Windows PowerShell 5.1에서는 이 스크립트를 실행할 수 없습니다.** 스크립트의 `#requires -Version 7.2` 조건에 따라 PowerShell 7.2 이상이 필요합니다. `Set-ExecutionPolicy`는 실행 정책만 변경하므로 버전 불일치 오류를 해결하지 못합니다.
+
+현재 터미널에서 다음 명령으로 PowerShell 7을 설치하세요.
+
+```powershell
+winget install --id Microsoft.PowerShell --source winget
+```
+
+PowerShell 7은 기존 Windows PowerShell 5.1과 별도로 설치됩니다. 설치 후 기존 터미널을 닫고 **시작 메뉴 → PowerShell 7 → 관리자 권한으로 실행**을 선택하세요. 새 창에서 버전이 7.2 이상인지 확인하고 저장소 디렉터리로 이동합니다.
+
+```powershell
+$PSVersionTable.PSVersion
+Set-Location 'C:\path\to\multipass'  # 실제 저장소 경로로 바꾸세요.
+```
+
+실행 정책으로 차단되면 PowerShell 7 창에서 다음 명령을 실행한 뒤 다시 시도하세요.
+
+```powershell
+Set-ExecutionPolicy -Scope CurrentUser -ExecutionPolicy RemoteSigned
+```
+
+이미 관리자 권한 터미널을 열었다면 `pwsh -NoProfile -File .\init.ps1`로 PowerShell 7을 명시하여 실행할 수도 있습니다. `#requires`를 삭제하지 마세요.
+
 ## 실행
 
 ```powershell
