@@ -4,13 +4,18 @@ Set-StrictMode -Version Latest
 
 # PowerShell does not reliably parse GNU-style --extend as a switch parameter.
 $extended = $false
-if ($args.Count -gt 1 -or ($args.Count -eq 1 -and $args[0] -notin @('-e', '--extend'))) {
-    throw 'Usage: .\init.ps1 [-e|--extend]'
+$resume = $false
+foreach ($argument in $args) {
+    switch ($argument) {
+        { $_ -in @('-e', '--extend') } { $extended = $true }
+        { $_ -in @('-Resume', '--resume') } { $resume = $true }
+        default { throw 'Usage: .\init.ps1 [-e|--extend] [-Resume]' }
+    }
 }
-if ($args.Count -eq 1) { $extended = $true }
 
 $root = Split-Path -Parent $PSCommandPath
 . (Join-Path $root 'scripts/host-access.ps1')
+. (Join-Path $root 'scripts/network.ps1')
 $switchName = 'MultipassK8s'
 $vip = '192.168.35.209'
 $k8sMinor = 'v1.37'
@@ -27,9 +32,13 @@ for ($i = 1; $i -le $workerCount; $i++) {
 
 function Invoke-Mp {
     param([Parameter(ValueFromRemainingArguments = $true)][string[]]$Arguments)
-    $output = & multipass @Arguments 2>&1
-    if ($LASTEXITCODE -ne 0) { throw "multipass $($Arguments -join ' ') failed: $($output -join [Environment]::NewLine)" }
-    return $output
+    $recent = [Collections.Generic.Queue[string]]::new()
+    & multipass @Arguments 2>&1 | ForEach-Object {
+        $recent.Enqueue([string]$_)
+        if ($recent.Count -gt 40) { $null = $recent.Dequeue() }
+        $_
+    }
+    if ($LASTEXITCODE -ne 0) { throw "multipass $($Arguments -join ' ') failed (exit $LASTEXITCODE): $($recent.ToArray() -join [Environment]::NewLine)" }
 }
 
 function Send-File {
@@ -53,15 +62,31 @@ $principal = [Security.Principal.WindowsPrincipal]::new($identity)
 if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) { throw 'Run PowerShell as Administrator.' }
 
 $existing = @((Invoke-Mp @('list', '--format', 'json') | Out-String | ConvertFrom-Json).list)
-if (@($existing | Where-Object { $_.name -like 'k8s-*' }).Count -gt 0) {
-    throw 'Existing k8s-* Multipass instances found. Run destroy.ps1 before rebuilding.'
+if (-not $resume -and @($existing | Where-Object { $_.name -like 'k8s-*' }).Count -gt 0) {
+    throw 'Existing k8s-* instances found. For a provisioning failure before kubeadm init/join, rerun with -Resume (and -e for extended).'
 }
+
 $driver = (Invoke-Mp @('get', 'local.driver') | Out-String).Trim()
 if ($driver -ne 'hyperv') {
     if ($existing.Count -gt 0) { throw "Current driver is '$driver' and has instances. Remove or migrate them before switching to hyperv." }
     Invoke-Mp @('set', 'local.driver=hyperv') | Out-Null
     $existing = @((Invoke-Mp @('list', '--format', 'json') | Out-String | ConvertFrom-Json).list)
     if ($existing.Count -gt 0) { throw 'The hyperv driver already has instances. Inspect them before building this cluster.' }
+}
+
+$expectedNames = @($nodes | ForEach-Object Name)
+$existingNames = @($existing | ForEach-Object name)
+if ($resume) {
+    $unexpected = @($existingNames | Where-Object { $_ -like 'k8s-*' -and $_ -notin $expectedNames })
+    if ($unexpected.Count) { throw "Existing nodes do not match this topology: $($unexpected -join ', '). Use the original -e setting." }
+    foreach ($node in $nodes) {
+        if ($node.Name -notin $existingNames) { continue }
+        $instance = $existing | Where-Object name -eq $node.Name
+        if ($instance.state -notin @('Running', 'Stopped')) { throw "Cannot resume $($node.Name) in state $($instance.state)." }
+        if ($instance.state -eq 'Stopped') { Invoke-Mp @('start', $node.Name) | Out-Host }
+        Send-File (Join-Path $root 'scripts/check-resume.sh') $node.Name '/home/ubuntu/multipass-k8s-check-resume.sh'
+        Run-Node $node.Name @('bash', '/home/ubuntu/multipass-k8s-check-resume.sh', $node.Name, $node.Mac) | Out-Host
+    }
 }
 
 $hostIps = @(Get-NetIPAddress -AddressFamily IPv4 | Where-Object { $_.IPAddress -match '^192\.168\.35\.\d+$' -and $_.PrefixLength -eq 24 -and $_.InterfaceAlias -notlike 'vEthernet*' })
@@ -77,6 +102,7 @@ $networks = Invoke-Mp @('networks') | Out-String
 if ($networks -notmatch "(?m)^$([regex]::Escape($switchName))\s+switch\s") { throw "$switchName is not visible to Multipass. Check the Hyper-V driver and switch." }
 
 foreach ($node in $nodes) {
+    if ($resume -and $node.Name -in $existingNames) { continue }
     if (Test-Connection -TargetName $node.IP -Count 1 -Quiet -TimeoutSeconds 1) { throw "IP $($node.IP) already responds on the LAN." }
 }
 if ($extended -and (Test-Connection -TargetName $vip -Count 1 -Quiet -TimeoutSeconds 1)) { throw "VIP $vip already responds on the LAN." }
@@ -91,9 +117,10 @@ try {
     if ($extended) { $hostsLines += "$vip k8s-api" } else { $hostsLines += '192.168.35.200 k8s-api' }
     [IO.File]::WriteAllText($hostsFile, ($hostsLines -join "`n") + "`n", [Text.UTF8Encoding]::new($false))
     foreach ($node in $nodes) {
-        Write-Host "Launching $($node.Name) at $($node.IP)"
-        $cloudInit = Join-Path $temporary "$($node.Name)-cloud-init.yaml"
-        @'
+        if ($node.Name -notin $existingNames) {
+            Write-Host "Launching $($node.Name) at $($node.IP)"
+            $cloudInit = Join-Path $temporary "$($node.Name)-cloud-init.yaml"
+            @'
 #cloud-config
 ssh_pwauth: true
 chpasswd:
@@ -107,7 +134,10 @@ packages:
 runcmd:
   - [systemctl, enable, --now, ssh]
 '@ | Set-Content -LiteralPath $cloudInit -Encoding utf8
-        Invoke-Mp @('launch', '24.04', '--name', $node.Name, '--cpus', "$($node.Cpu)", '--memory', $node.Memory, '--disk', $node.Disk, '--network', "name=$switchName,mode=manual,mac=$($node.Mac)", '--cloud-init', $cloudInit, '--timeout', '900') | Out-Host
+            Invoke-Mp @('launch', '24.04', '--name', $node.Name, '--cpus', "$($node.Cpu)", '--memory', $node.Memory, '--disk', $node.Disk, '--network', "name=$switchName,mode=manual,mac=$($node.Mac)", '--cloud-init', $cloudInit, '--timeout', '900') | Out-Host
+        } else {
+            Write-Host "Resuming provisioning of $($node.Name) at $($node.IP)"
+        }
         Run-Node $node.Name @('cloud-init', 'status', '--wait') | Out-Null
         $netplan = Join-Path $temporary "$($node.Name)-netplan.yaml"
         @"
@@ -123,7 +153,9 @@ network:
         Send-File $netplan $node.Name '/home/ubuntu/10-k8s-lan.yaml'
         Run-Node $node.Name @('sudo', 'mv', '/home/ubuntu/10-k8s-lan.yaml', '/etc/netplan/10-k8s-lan.yaml') | Out-Null
         Run-Node $node.Name @('sudo', 'chmod', '600', '/etc/netplan/10-k8s-lan.yaml') | Out-Null
-        Run-Node $node.Name @('sudo', 'netplan', 'apply') | Out-Null
+        Send-File (Join-Path $root 'scripts/apply-network.sh') $node.Name '/home/ubuntu/multipass-k8s-apply-network.sh'
+        Run-Node $node.Name @('sudo', 'install', '-D', '-m', '755', '/home/ubuntu/multipass-k8s-apply-network.sh', '/usr/local/lib/multipass-k8s/apply-network.sh') | Out-Null
+        Set-LabNodeNetwork -Node $node.Name -Address $node.IP -Mac $node.Mac
         Run-Node $node.Name @('bash', '-c', "ip -4 addr | grep -F '$($node.IP)/24'") | Out-Null
         Send-File (Join-Path $root 'scripts/setup-node.sh') $node.Name '/home/ubuntu/setup-node.sh'
         Run-Node $node.Name @('bash', '/home/ubuntu/setup-node.sh', $k8sMinor, $node.IP) | Out-Host

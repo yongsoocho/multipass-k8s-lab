@@ -137,7 +137,8 @@ Pod가 준비되면 `http://192.168.35.201:30080`으로 확인할 수 있습니�
 
 - Kubernetes 패키지는 `v1.37` 저장소를 사용합니다. 설치된 kubeadm 버전으로 제어면 이미지 버전을 고정합니다. `scripts/setup-node.sh`는 containerd와 systemd cgroup, kubelet 노드 IP를 설정합니다.
 - 초기 구축에는 CNI를 배포하지 않습니다. Calico/Flannel 선택 설치는 별도 스크립트가 담당합니다.
-- `init.ps1`는 기존 `k8s-*` VM을 발견하면 중단합니다. 중간 실패 뒤에는 원인을 확인하고 `destroy.ps1`로 정리한 다음 다시 실행합니다.
+- `init.ps1`는 기존 `k8s-*` VM을 발견하면 중단합니다. **kubeadm init/join 이전** 네트워크·패키지 설치 단계에서 실패했다면 VM을 보존한 채 `./init.ps1 -Resume`으로 재개하세요. 확장 구성은 `./init.ps1 -e -Resume`입니다. VM 이름·LAN MAC과 Kubernetes 초기화 여부를 확인하며, 이미 초기화된 노드는 재개를 거부합니다.
+- `netplan apply` 중 기본 NIC의 DHCP 주소가 바뀌면 Multipass 연결이 잠시 끊길 수 있습니다. 네트워크 적용은 VM 내부의 독립된 systemd 작업으로 실행하고, 최대 240초 동안 재접속과 작업 결과를 확인합니다. 고정 IP와 관리용 기본 경로까지 확인해야 다음 단계로 진행합니다. 실패 시 출력되는 VM 내부 `apply.log` 경로를 확인하세요.
 - Multipass 1.17부터 기존 `hyperv` 드라이버는 사용 중단 예정입니다. 이 프로젝트는 요청대로 해당 드라이버를 명시적으로 선택합니다.
 
 `pwsh -NoProfile -File .\tests\verify.ps1`은 PowerShell 구문과 격리된 테스트 디렉터리에서 SSH 설정/키 생성·정리를 검사합니다. 실제 클러스터 통합 테스트에는 Hyper-V와 Multipass가 필요합니다.
