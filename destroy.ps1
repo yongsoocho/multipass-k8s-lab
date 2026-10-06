@@ -2,52 +2,49 @@
 $ErrorActionPreference = 'Stop'
 Set-StrictMode -Version Latest
 . (Join-Path $PSScriptRoot 'scripts/host-access.ps1')
+. (Join-Path $PSScriptRoot 'scripts/network.ps1')
+. (Join-Path $PSScriptRoot 'scripts/destroy-common.ps1')
 
 if ($args.Count -ne 0) { throw 'Usage: .\destroy.ps1' }
 if (-not (Get-Command multipass -ErrorAction SilentlyContinue)) { throw 'Multipass is not installed.' }
+$identity = [Security.Principal.WindowsIdentity]::GetCurrent()
+$principal = [Security.Principal.WindowsPrincipal]::new($identity)
+if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
+    throw 'Run PowerShell 7 as Administrator. No cleanup has started.'
+}
 
-$originalDriver = (& multipass get local.driver | Out-String).Trim()
-if ($LASTEXITCODE -ne 0) { throw 'Cannot read Multipass driver.' }
-$drivers = @($originalDriver, 'hyperv', 'hcs', 'virtualbox') | Select-Object -Unique
-$failedDrivers = [System.Collections.Generic.List[string]]::new()
+$originalDriver = Get-LabDestroyDriver
+$versionResult = Invoke-LabMultipassProbe -Arguments @('version')
+if ($versionResult.ExitCode -ne 0 -or $versionResult.StandardOutput -notmatch '(?m)^multipass\s+(\d+\.\d+\.\d+)') {
+    throw "Cannot determine Multipass version: $($versionResult.Output)"
+}
+$version = [version]$Matches[1]
+$vboxRegistry = Get-ItemProperty 'HKLM:\SOFTWARE\Oracle\VirtualBox' -ErrorAction SilentlyContinue
+$vboxPaths = @((Join-Path $env:ProgramFiles 'Oracle/VirtualBox/VBoxManage.exe'))
+if ($vboxRegistry -and $vboxRegistry.PSObject.Properties['InstallDir'] -and $vboxRegistry.InstallDir) { $vboxPaths += Join-Path $vboxRegistry.InstallDir 'VBoxManage.exe' }
+$vboxAvailable = [bool](Get-Command VBoxManage -ErrorAction SilentlyContinue) -or @($vboxPaths | Where-Object { Test-Path -LiteralPath $_ }).Count -gt 0
+$plan = Get-LabDestroyPlan -OriginalDriver $originalDriver -Version $version -HyperVAvailable ([bool](Get-Command Get-VMSwitch -ErrorAction SilentlyContinue)) -VirtualBoxAvailable $vboxAvailable
+foreach ($reason in $plan.Skipped) { Write-Host "Skipping $reason" }
+$result = Invoke-LabDestroyDrivers -OriginalDriver $originalDriver -Drivers $plan.Drivers
+$failures = [Collections.Generic.List[string]]::new()
+foreach ($failure in $result.Failures) { $failures.Add($failure) }
+
+# Finish independent cleanup even if a different backend failed. Do not remove
+# a switch still attached to any VM (including non-Multipass Hyper-V VMs).
 try {
-    foreach ($driver in $drivers) {
-        if ($driver -ne $originalDriver) {
-            & multipass set "local.driver=$driver" 2>$null
-            if ($LASTEXITCODE -ne 0) {
-                Write-Warning "Could not switch to '$driver' (possibly unsupported by this Multipass version)."
-                $failedDrivers.Add($driver)
-                continue
-            }
-        }
-        $list = & multipass list --format json | Out-String | ConvertFrom-Json
-        if ($LASTEXITCODE -ne 0) { throw "Cannot list Multipass instances under '$driver'." }
-        $names = @($list.list | ForEach-Object { $_.name })
-        if ($names.Count -gt 0) {
-            & multipass delete --purge @names
-            if ($LASTEXITCODE -ne 0) { throw "Multipass deletion failed under '$driver'." }
-        }
-        & multipass purge
-        if ($LASTEXITCODE -ne 0) { throw "Multipass purge failed under '$driver'." }
+    if (-not (Get-Command Get-VMSwitch -ErrorAction SilentlyContinue)) { throw 'Cannot verify/remove the lab switch: Hyper-V module unavailable.' }
+    $switch = @(Get-VMSwitch -ErrorAction Stop | Where-Object Name -eq 'MultipassK8s')
+    if ($switch.Count) {
+        $attached = @(Get-VM -ErrorAction Stop | Get-VMNetworkAdapter -ErrorAction Stop | Where-Object SwitchName -eq 'MultipassK8s')
+        if ($attached.Count) { throw 'MultipassK8s still has attached VMs; switch was preserved.' }
+        Remove-VMSwitch -Name 'MultipassK8s' -Force -ErrorAction Stop
     }
-}
-finally {
-    & multipass set "local.driver=$originalDriver" | Out-Null
-    if ($LASTEXITCODE -ne 0) { Write-Warning "Could not restore Multipass driver '$originalDriver'." }
-}
-
-$switchName = 'MultipassK8s'
-if (Get-Command Get-VMSwitch -ErrorAction SilentlyContinue) {
-    $switch = Get-VMSwitch -Name $switchName -ErrorAction SilentlyContinue
-    if ($switch) {
-        $identity = [Security.Principal.WindowsIdentity]::GetCurrent()
-        $principal = [Security.Principal.WindowsPrincipal]::new($identity)
-        if (-not $principal.IsInRole([Security.Principal.WindowsBuiltInRole]::Administrator)) {
-            throw "Instances were deleted; rerun as Administrator to remove Hyper-V switch $switchName."
-        }
-        Remove-VMSwitch -Name $switchName -Force
-    }
-}
-Remove-LabHostAccess
-if ($failedDrivers.Count -gt 0) { Write-Warning "These drivers could not be inspected: $($failedDrivers -join ', '). If you used them before, check their installation and permissions before assuming every VM was removed." }
-Write-Host 'All instances in inspected Multipass drivers were purged; the lab switch and current user lab SSH configuration were removed if present.'
+    Write-Host 'Lab Hyper-V switch removed (or already absent).'
+} catch { $failures.Add("Network cleanup: $($_.Exception.Message)") }
+try {
+    if ('hyperv' -notin $result.Purged) { throw 'Hyper-V deletion was not verified; lab SSH access was preserved.' }
+    Remove-LabHostAccess
+    Write-Host 'Lab SSH configuration and dedicated keys removed (or already absent).'
+} catch { $failures.Add("SSH cleanup: $($_.Exception.Message)") }
+if ($failures.Count) { throw "Cleanup incomplete. Fix the following and rerun destroy.ps1:`n$($failures -join "`n")" }
+Write-Host "Cleanup complete. Verified empty drivers: $($result.Purged -join ', ')."

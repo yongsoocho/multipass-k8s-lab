@@ -11,10 +11,12 @@ function Invoke-LabMultipassProbe {
     $stderr = $process.StandardError.ReadToEndAsync()
     $timedOut = -not $process.WaitForExit($TimeoutSeconds * 1000)
     if ($timedOut) { $process.Kill($true); $process.WaitForExit() }
-    $output = $stdout.GetAwaiter().GetResult() + $stderr.GetAwaiter().GetResult()
+    $standardOutput = $stdout.GetAwaiter().GetResult()
+    $standardError = $stderr.GetAwaiter().GetResult()
+    $output = $standardOutput + $standardError
     $exitCode = if ($timedOut) { -1 } else { $process.ExitCode }
     $process.Dispose()
-    [pscustomobject]@{ ExitCode = $exitCode; Output = $output.Trim(); TimedOut = $timedOut }
+    [pscustomobject]@{ ExitCode = $exitCode; Output = $output.Trim(); TimedOut = $timedOut; StandardOutput = $standardOutput; StandardError = $standardError }
 }
 
 function Set-LabNodeNetwork {

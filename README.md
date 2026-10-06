@@ -129,7 +129,11 @@ Pod가 준비되면 `http://192.168.35.201:30080`으로 확인할 수 있습니�
 .\destroy.ps1
 ```
 
-이 명령은 Windows Multipass의 현재 드라이버와 `hyperv`·`hcs`·`virtualbox` 드라이버에서 보이는 **모든 VM**과 그 디스크·스냅샷을 영구 삭제하고, 삭제 대기 중인 VM을 purge하며, 이 프로젝트의 `MultipassK8s` Hyper-V 스위치를 제거합니다. 실행 후 원래 드라이버를 복원합니다. 설치된 Multipass 버전에서 지원하지 않는 드라이버는 경고와 함께 건너뜁니다. 다른 Hyper-V 스위치와 Docker 볼륨/네트워크는 건드리지 않습니다.
+**초기화와 같은 Windows 계정의 관리자 PowerShell 7**에서 실행합니다. 이 명령은 현재 드라이버와 사용 가능한 Windows Multipass 드라이버에서 보이는 **모든 VM**과 그 디스크·스냅샷을 영구 삭제하고, 삭제 대기 중인 VM을 purge하며, 이 프로젝트의 `MultipassK8s` Hyper-V 스위치를 제거합니다. Multipass 1.16에서는 `hcs`를 시도하지 않고, 설치되지 않은 VirtualBox도 전환하지 않습니다. 건너뛴 드라이버와 이유를 출력합니다. 현재 활성 드라이버는 항상 검사 대상입니다.
+
+드라이버 전환 후에는 접속과 인벤토리를 재확인하며 일시적인 TLS/socket 오류를 재시도합니다. JSON과 stderr 진단 메시지는 분리해서 처리합니다. 각 드라이버의 빈 VM 목록과 원래 드라이버 복원까지 검증합니다. 일부 단계가 실패하면 나머지 가능한 정리를 수행한 뒤 미완료 항목을 오류로 보고합니다. 같은 명령을 다시 실행해도 됩니다. VM이 남아 연결된 스위치는 제거하지 않으며, Hyper-V 삭제를 확인하지 못한 경우 SSH 접속 설정도 보존합니다.
+
+다른 Hyper-V 스위치와 Docker 볼륨/네트워크, Multipass 인증서 및 공유 이미지 다운로드 캐시는 유지합니다. VM에 속한 디스크와 스냅샷은 Multipass의 `delete --all --purge`와 `purge`로 정리합니다. [Multipass 삭제 명령 문서](https://canonical.com/multipass/docs/latest/reference/command-line-interface/delete/)
 
 현재 Windows 사용자의 SSH 설정에서 프로젝트 블록과 표식이 있는 전용 키·known_hosts 디렉터리도 제거합니다. 기존 개인 SSH 키와 다른 설정은 유지합니다. 초기화와 같은 Windows 계정으로 실행하세요.
 
@@ -143,6 +147,8 @@ Pod가 준비되면 `http://192.168.35.201:30080`으로 확인할 수 있습니�
 - Multipass 1.17부터 기존 `hyperv` 드라이버는 사용 중단 예정입니다. 이 프로젝트는 요청대로 해당 드라이버를 명시적으로 선택합니다.
 
 `pwsh -NoProfile -File .\tests\verify.ps1`은 PowerShell 구문과 격리된 테스트 디렉터리에서 SSH 설정/키 생성·정리를 검사합니다. 실제 클러스터 통합 테스트에는 Hyper-V와 Multipass가 필요합니다.
+
+`pwsh -NoProfile -File .\tests\destroy.ps1`은 VM을 변경하지 않고 드라이버 선택, TLS 재시도, 일부 드라이버 실패, 원래 드라이버 복원, 남은 VM 검출, 반복 정리를 검사합니다.
 
 `pwsh -NoProfile -File .\tests\network.ps1`은 연결 끊김·재접속·타임아웃 처리를 검사합니다. 실행 중인 VM이 있으면 `pwsh -NoProfile -File .\tests\transfer-live.ps1 -Node k8s-master-1`로 한글·공백·괄호 경로, 바이너리·빈 파일, 모든 셸 스크립트의 실제 전송과 SHA256을 검사할 수 있습니다. 이 검사는 VM의 임시 디렉터리만 사용하고 정리합니다.
 
